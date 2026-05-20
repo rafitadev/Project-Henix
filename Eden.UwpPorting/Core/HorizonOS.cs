@@ -91,8 +91,9 @@ public sealed class HorizonOS
                 return true;
             }
             default:
-                Debug.WriteLine($"[HOS] Unhandled SVC 0x{svcId:X}");
-                return false;
+                x[0] = 0;
+                BootDiagnostics.Warn($"Unhandled SVC 0x{svcId:X} treated as success for boot progression.");
+                return true;
         }
     }
 
@@ -126,6 +127,16 @@ public sealed class HorizonOS
                 _mmu.WriteUInt32(tls + 0x80, 0x2);
                 _mmu.WriteUInt32(tls + 0x84, 0);
                 _mmu.WriteUInt32(tls + 0x88, (uint)serviceHandle);
+            }
+        }
+        else if (service.StartsWith("hid", StringComparison.Ordinal))
+        {
+            uint cmdId = commandId;
+            _mmu.WriteUInt32(tls + 0x80, 0x2);
+            _mmu.WriteUInt32(tls + 0x84, 0);
+            if (cmdId == 0x1 || cmdId == 0x2 || cmdId == 0x4)
+            {
+                _mmu.WriteUInt64(tls + 0xA0, RuntimeSharedState.Input.Buttons);
             }
         }
         else

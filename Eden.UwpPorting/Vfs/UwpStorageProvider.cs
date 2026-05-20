@@ -144,6 +144,7 @@ public sealed class UwpStorageProvider : IVirtualFileSystem
 
         long stringTablePos = stream.Position;
         byte[] stringTable = br.ReadBytes(stringTableSize);
+        string? firstNca = null;
         foreach (var e in entries)
         {
             string name = ReadCString(stringTable, e.NameOffset);
@@ -184,12 +185,19 @@ public sealed class UwpStorageProvider : IVirtualFileSystem
         foreach (var e in entries)
         {
             string name = ReadCString(stringTable, e.NameOffset);
+            if (name.EndsWith(".nca", true, CultureInfo.InvariantCulture) && firstNca is null) firstNca = name;
             if (!name.EndsWith(".nro", true, CultureInfo.InvariantCulture)) continue;
 
             stream.Position = dataOffset + e.Offset;
             byte[] nro = br.ReadBytes((int)e.Size);
             using var nroStream = new MemoryStream(nro, writable: false);
             return ReadNro(nroStream);
+        }
+
+        if (firstNca is not null)
+        {
+            BootDiagnostics.Error($"NSP contém NCA ({firstNca}) e requer pipeline NCA/NSO do Eden upstream. Caminho NRO-only não cobre título comercial.");
+            throw new InvalidDataException("NSP comercial detectado (NCA). Integração NCA/NSO pendente.");
         }
 
         throw new InvalidDataException("NSP sem conteúdo NRO suportado encontrado.");
