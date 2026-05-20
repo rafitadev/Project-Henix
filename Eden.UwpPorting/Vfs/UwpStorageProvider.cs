@@ -259,7 +259,19 @@ public sealed class UwpStorageProvider : IVirtualFileSystem
     {
         image = null;
 
-        // Estratégia pragmática: detectar NSO0 bruto dentro do blob NCA (caso dumps pré-processados).
+        try
+        {
+            if (TryExtractNsoFromProgramNca(ncaData, out image))
+            {
+                return true;
+            }
+        }
+        catch (Exception ex)
+        {
+            BootDiagnostics.Warn($"Falha no parser Program NCA ({ncaName}): {ex.Message}");
+        }
+
+        // Fallback explícito: dumps pré-processados podem conter NSO0 bruto.
         int nsoOffset = IndexOfAscii(ncaData, "NSO0");
         if (nsoOffset < 0)
         {
@@ -280,10 +292,75 @@ public sealed class UwpStorageProvider : IVirtualFileSystem
         }
     }
 
-    private static int IndexOfAscii(byte[] data, string pattern)
+    private static bool TryExtractNsoFromProgramNca(byte[] ncaData, out RuntimeImage? image)
+    {
+        image = null;
+        if (ncaData.Length < 0xC00) return false;
+
+        // NCA header layout (simplificado para Program NCA não-criptografado pré-processado).
+        // section entries em 0x240..0x2BF (4x start/end media units).
+        for (int i = 0; i < 4; i++)
+        {
+            int entry = 0x240 + i * 0x10;
+            uint startMu = BitConverter.ToUInt32(ncaData, entry + 0x0);
+            uint endMu = BitConverter.ToUInt32(ncaData, entry + 0x4);
+            if (startMu == 0 || endMu <= startMu) continue;
+
+            long sectionOffset = (long)startMu * 0x200;
+            long sectionSize = ((long)endMu - startMu) * 0x200;
+            if (sectionOffset < 0 || sectionOffset + sectionSize > ncaData.LongLength) continue;
+
+            // buscar PFS0 em seção Program FS
+            int relPfs = IndexOfAscii(ncaData, "PFS0", (int)sectionOffset, (int)sectionSize);
+            if (relPfs < 0) continue;
+
+            using var pfsStream = new MemoryStream(ncaData, relPfs, ncaData.Length - relPfs, writable: false);
+            using var br = new BinaryReader(pfsStream, Encoding.UTF8, leaveOpen: true);
+            string magic = Encoding.ASCII.GetString(br.ReadBytes(4));
+            if (!magic.Equals("PFS0", StringComparison.Ordinal)) continue;
+
+            int fileCount = br.ReadInt32();
+            int strSize = br.ReadInt32();
+            _ = br.ReadInt32();
+
+            var files = new List<(long Off,long Size,int NameOff)>();
+            for (int f = 0; f < fileCount; f++)
+            {
+                long off = br.ReadInt64();
+                long size = br.ReadInt64();
+                int nameOff = br.ReadInt32();
+                _ = br.ReadInt32();
+                files.Add((off,size,nameOff));
+            }
+
+            byte[] strTab = br.ReadBytes(strSize);
+            long dataOff = 0x10 + fileCount * 0x18 + strSize;
+
+            foreach (var f in files)
+            {
+                string fname = ReadCString(strTab, f.NameOff);
+                if (!fname.Equals("main", StringComparison.OrdinalIgnoreCase) && !fname.EndsWith(".nso", StringComparison.OrdinalIgnoreCase))
+                {
+                    continue;
+                }
+
+                pfsStream.Position = dataOff + f.Off;
+                byte[] nso = br.ReadBytes((int)f.Size);
+                using var nsoStream = new MemoryStream(nso, writable: false);
+                image = ReadNso(nsoStream);
+                BootDiagnostics.Info($"Program NCA -> PFS0 -> {fname} extraído");
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private static int IndexOfAscii(byte[] data, string pattern, int start = 0, int length = -1)
     {
         byte[] pat = Encoding.ASCII.GetBytes(pattern);
-        for (int i = 0; i <= data.Length - pat.Length; i++)
+        int end = length < 0 ? data.Length : Math.Min(data.Length, start + length);
+        for (int i = start; i <= end - pat.Length; i++)
         {
             bool match = true;
             for (int j = 0; j < pat.Length; j++)
