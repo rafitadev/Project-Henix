@@ -1,4 +1,5 @@
 using Eden.UwpPorting.Core;
+using System.Diagnostics;
 using K4os.Compression.LZ4;
 using System.Buffers.Binary;
 using System.Globalization;
@@ -60,7 +61,8 @@ public sealed class UwpStorageProvider : IVirtualFileSystem
         StorageFile? prod = await TryGetFileAsync(keysFolder, "prod.keys");
         if (prod is null)
         {
-            throw new FileNotFoundException("prod.keys não encontrado em LocalFolder/keys.");
+            BootDiagnostics.Warn("prod.keys não encontrado; continuando para permitir boot de homebrew sem criptografia.");
+            return;
         }
 
         string content = await FileIO.ReadTextAsync(prod);
@@ -103,17 +105,20 @@ public sealed class UwpStorageProvider : IVirtualFileSystem
         using var stream = await file.OpenStreamForReadAsync();
         using var reader = new BinaryReader(stream, Encoding.UTF8, leaveOpen: true);
 
-        byte[] magic = reader.ReadBytes(4);
+        byte[] header = reader.ReadBytes(0x120);
         stream.Position = 0;
 
-        string textMagic = Encoding.ASCII.GetString(magic);
-        return textMagic switch
-        {
-            "NRO0" => ReadNro(stream),
-            "PFS0" => ReadFromPfs0(stream),
-            "HEAD" => ReadFromXci(stream),
-            _ => throw new InvalidDataException($"Formato não suportado: {textMagic}")
-        };
+        string at0 = Encoding.ASCII.GetString(header, 0, Math.Min(4, header.Length));
+        string at10 = header.Length >= 0x14 ? Encoding.ASCII.GetString(header, 0x10, 4) : string.Empty;
+        string at100 = header.Length >= 0x104 ? Encoding.ASCII.GetString(header, 0x100, 4) : string.Empty;
+
+        BootDiagnostics.Info($"Detect magic @0={at0} @0x10={at10} @0x100={at100}");
+
+        if (at10 == "NRO0") return ReadNro(stream);
+        if (at0 == "PFS0") return ReadFromPfs0(stream);
+        if (at100 == "HFS0" || at0 == "HEAD") return ReadFromXci(stream);
+
+        throw new InvalidDataException($"Formato não suportado: @0={at0} @0x10={at10} @0x100={at100}");
     }
 
     private static RuntimeImage ReadFromXci(Stream stream)
@@ -143,7 +148,7 @@ public sealed class UwpStorageProvider : IVirtualFileSystem
         {
             string name = ReadCString(stringTable, e.NameOffset);
             if (!name.EndsWith(".nsp", true, CultureInfo.InvariantCulture)) continue;
-            long filePos = 0x100 + 0x10 + fileCount * 0x40 + stringTableSize + e.Offset;
+            long filePos = 0x100 + 0x10 + fileCount * 0x18 + stringTableSize + e.Offset;
             stream.Position = filePos;
             byte[] nsp = br.ReadBytes((int)e.Size);
             using var nspStream = new MemoryStream(nsp, writable: false);
@@ -193,25 +198,21 @@ public sealed class UwpStorageProvider : IVirtualFileSystem
     private static RuntimeImage ReadNro(Stream stream)
     {
         using var br = new BinaryReader(stream, Encoding.UTF8, leaveOpen: true);
-        stream.Position = 0;
-        _ = br.ReadUInt32();
-        _ = br.ReadUInt32();
-        _ = br.ReadUInt32();
-        _ = br.ReadUInt32();
+        stream.Position = 0x10;
         string magic = Encoding.ASCII.GetString(br.ReadBytes(4));
         if (!magic.Equals("NRO0", StringComparison.Ordinal)) throw new InvalidDataException("NRO inválido.");
 
-        _ = br.ReadUInt32();
+        _ = br.ReadUInt32(); // version
         int nroSize = br.ReadInt32();
-        _ = br.ReadInt32();
+        _ = br.ReadInt32(); // flags
+
         int textOffset = br.ReadInt32();
         int textSize = br.ReadInt32();
         int roOffset = br.ReadInt32();
         int roSize = br.ReadInt32();
         int dataOffset = br.ReadInt32();
         int dataSize = br.ReadInt32();
-        int bssSize = br.ReadInt32();
-        _ = bssSize;
+        _ = br.ReadInt32(); // bssSize
 
         stream.Position = textOffset;
         byte[] text = br.ReadBytes(textSize);
@@ -220,24 +221,29 @@ public sealed class UwpStorageProvider : IVirtualFileSystem
         stream.Position = dataOffset;
         byte[] data = br.ReadBytes(dataSize);
 
-        if (nroSize < dataOffset + dataSize && nroSize > 0)
+        if (stream.Length > nroSize)
         {
-            int compressedSize = (int)(stream.Length - stream.Position);
-            if (compressedSize > 0)
+            long compressedPos = dataOffset + dataSize;
+            if (compressedPos < stream.Length)
             {
-                byte[] compressed = br.ReadBytes(compressedSize);
-                byte[] inflated = new byte[dataSize];
-                int decoded = LZ4Codec.Decode(compressed, 0, compressed.Length, inflated, 0, inflated.Length);
-                if (decoded > 0)
+                stream.Position = compressedPos;
+                int compressedSize = (int)(stream.Length - stream.Position);
+                if (compressedSize > 0)
                 {
-                    data = inflated;
+                    byte[] compressed = br.ReadBytes(compressedSize);
+                    byte[] inflated = new byte[dataSize];
+                    int decoded = LZ4Codec.Decode(compressed, 0, compressed.Length, inflated, 0, inflated.Length);
+                    if (decoded > 0)
+                    {
+                        data = inflated;
+                    }
                 }
             }
         }
 
         return new RuntimeImage
         {
-            EntryPoint = 0x7100000000,
+            EntryPoint = 0x0000007100000000,
             Text = text,
             Rodata = ro,
             Data = data

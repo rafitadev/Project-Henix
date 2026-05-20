@@ -3,6 +3,7 @@ using Eden.UwpPorting.Cpu;
 using Eden.UwpPorting.Gpu;
 using Eden.UwpPorting.Input;
 using Eden.UwpPorting.Vfs;
+using System.Diagnostics;
 using Windows.UI.Xaml.Controls;
 
 namespace Eden.UwpPorting.Core;
@@ -51,17 +52,22 @@ public sealed class EdenRuntime
 
     public async Task BootAsync(CancellationToken ct = default)
     {
+        BootDiagnostics.Info($"Boot start: {Settings.GamePath}");
         await _vfs.InitializeAsync(ct);
         await _vfs.TryLoadSwitchKeysAsync(ct);
 
         _cpu.Configure(CpuExecutionMode.InterpreterOnly);
+        BootDiagnostics.Info("CPU configured (InterpreterOnly)");
         _gpu.Initialize();
+        BootDiagnostics.Info("GPU initialized");
         _audio.Initialize();
+        BootDiagnostics.Info("Audio initialized");
 
         while (!ct.IsCancellationRequested)
         {
             _input.Poll();
-            _cpu.StepFrame();
+            try { _cpu.StepFrame(); }
+            catch (Exception ex) { BootDiagnostics.Error($"CPU fault: {ex.Message}"); throw; }
             _gpu.Present();
             _audio.PushFrame();
             await Task.Delay(1, ct);
