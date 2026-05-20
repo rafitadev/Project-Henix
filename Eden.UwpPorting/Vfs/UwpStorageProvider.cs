@@ -186,12 +186,21 @@ public sealed class UwpStorageProvider : IVirtualFileSystem
         {
             string name = ReadCString(stringTable, e.NameOffset);
             if (name.EndsWith(".nca", true, CultureInfo.InvariantCulture) && firstNca is null) firstNca = name;
-            if (!name.EndsWith(".nro", true, CultureInfo.InvariantCulture)) continue;
 
             stream.Position = dataOffset + e.Offset;
-            byte[] nro = br.ReadBytes((int)e.Size);
-            using var nroStream = new MemoryStream(nro, writable: false);
-            return ReadNro(nroStream);
+            byte[] blob = br.ReadBytes((int)e.Size);
+
+            if (name.EndsWith(".nro", true, CultureInfo.InvariantCulture))
+            {
+                using var nroStream = new MemoryStream(blob, writable: false);
+                return ReadNro(nroStream);
+            }
+
+            if (name.EndsWith(".nso", true, CultureInfo.InvariantCulture) || name.Equals("main", StringComparison.OrdinalIgnoreCase))
+            {
+                using var nsoStream = new MemoryStream(blob, writable: false);
+                return ReadNso(nsoStream);
+            }
         }
 
         if (firstNca is not null)
@@ -256,6 +265,68 @@ public sealed class UwpStorageProvider : IVirtualFileSystem
             Rodata = ro,
             Data = data
         };
+    }
+
+
+    private static RuntimeImage ReadNso(Stream stream)
+    {
+        using var br = new BinaryReader(stream, Encoding.UTF8, leaveOpen: true);
+        stream.Position = 0;
+        string magic = Encoding.ASCII.GetString(br.ReadBytes(4));
+        if (!magic.Equals("NSO0", StringComparison.Ordinal)) throw new InvalidDataException("NSO inválido.");
+
+        _ = br.ReadUInt32(); // version
+        _ = br.ReadUInt32(); // reserved
+        uint flags = br.ReadUInt32();
+
+        int textFileOff = br.ReadInt32();
+        int textMemOff = br.ReadInt32();
+        int textSize = br.ReadInt32();
+
+        int roFileOff = br.ReadInt32();
+        int roMemOff = br.ReadInt32();
+        int roSize = br.ReadInt32();
+
+        int dataFileOff = br.ReadInt32();
+        int dataMemOff = br.ReadInt32();
+        int dataSize = br.ReadInt32();
+
+        _ = br.ReadInt32(); // bss
+        _ = br.ReadInt32();
+        _ = br.ReadInt32();
+        _ = br.ReadInt32();
+
+        int textCompSize = br.ReadInt32();
+        int roCompSize = br.ReadInt32();
+        int dataCompSize = br.ReadInt32();
+
+        // skip build id and hashes
+
+        byte[] text = ReadNsoSegment(stream, textFileOff, textCompSize, textSize, (flags & 1) != 0);
+        byte[] ro = ReadNsoSegment(stream, roFileOff, roCompSize, roSize, (flags & 2) != 0);
+        byte[] data = ReadNsoSegment(stream, dataFileOff, dataCompSize, dataSize, (flags & 4) != 0);
+
+        BootDiagnostics.Info($"NSO loaded text={text.Length} ro={ro.Length} data={data.Length}");
+
+        return new RuntimeImage
+        {
+            EntryPoint = 0x0000007100000000 + (ulong)textMemOff,
+            Text = text,
+            Rodata = ro,
+            Data = data
+        };
+    }
+
+    private static byte[] ReadNsoSegment(Stream stream, int fileOff, int compSize, int decompSize, bool compressed)
+    {
+        stream.Position = fileOff;
+        byte[] src = new BinaryReader(stream, Encoding.UTF8, leaveOpen: true).ReadBytes(compressed ? compSize : decompSize);
+        if (!compressed) return src;
+
+        byte[] dst = new byte[decompSize];
+        int decoded = LZ4Codec.Decode(src, 0, src.Length, dst, 0, dst.Length);
+        if (decoded <= 0) throw new InvalidDataException("Falha ao descomprimir segmento NSO LZ4.");
+        return dst;
     }
 
     private static string ReadCString(byte[] bytes, int offset)

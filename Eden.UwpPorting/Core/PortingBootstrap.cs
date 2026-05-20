@@ -63,11 +63,20 @@ public sealed class EdenRuntime
         _audio.Initialize();
         BootDiagnostics.Info("Audio initialized");
 
+        bool cpuHalted = false;
         while (!ct.IsCancellationRequested)
         {
             _input.Poll();
-            try { _cpu.StepFrame(); }
-            catch (Exception ex) { BootDiagnostics.Error($"CPU fault: {ex.Message}"); throw; }
+            if (!cpuHalted)
+            {
+                try { _cpu.StepFrame(); }
+                catch (Exception ex)
+                {
+                    cpuHalted = true;
+                    BootDiagnostics.Error($"CPU fault: {ex.Message}. Mantendo render loop ativo para diagnóstico visual.");
+                }
+            }
+
             _gpu.Present();
             _audio.PushFrame();
             await Task.Delay(1, ct);
