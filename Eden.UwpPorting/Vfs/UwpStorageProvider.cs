@@ -4,6 +4,7 @@ using K4os.Compression.LZ4;
 using System.Buffers.Binary;
 using System.Globalization;
 using System.Text;
+using System.Linq;
 using Windows.Storage;
 using Windows.Storage.AccessCache;
 using Windows.Storage.Pickers;
@@ -144,48 +145,10 @@ public sealed class UwpStorageProvider : IVirtualFileSystem
 
         long stringTablePos = stream.Position;
         byte[] stringTable = br.ReadBytes(stringTableSize);
-        string? firstNca = null;
+        var ncaCandidates = new List<(string Name, byte[] Data)>();
         foreach (var e in entries)
         {
             string name = ReadCString(stringTable, e.NameOffset);
-            if (!name.EndsWith(".nsp", true, CultureInfo.InvariantCulture)) continue;
-            long filePos = 0x100 + 0x10 + fileCount * 0x18 + stringTableSize + e.Offset;
-            stream.Position = filePos;
-            byte[] nsp = br.ReadBytes((int)e.Size);
-            using var nspStream = new MemoryStream(nsp, writable: false);
-            return ReadFromPfs0(nspStream);
-        }
-
-        throw new InvalidDataException("XCI sem partição NSP encontrada.");
-    }
-
-    private static RuntimeImage ReadFromPfs0(Stream stream)
-    {
-        using var br = new BinaryReader(stream, Encoding.UTF8, leaveOpen: true);
-        string magic = Encoding.ASCII.GetString(br.ReadBytes(4));
-        if (!magic.Equals("PFS0", StringComparison.Ordinal)) throw new InvalidDataException("Container NSP inválido.");
-
-        int fileCount = br.ReadInt32();
-        int stringTableSize = br.ReadInt32();
-        _ = br.ReadInt32();
-
-        var entries = new List<(long Offset, long Size, int NameOffset)>();
-        for (int i = 0; i < fileCount; i++)
-        {
-            long offset = br.ReadInt64();
-            long size = br.ReadInt64();
-            int nameOffset = br.ReadInt32();
-            _ = br.ReadInt32();
-            entries.Add((offset, size, nameOffset));
-        }
-
-        byte[] stringTable = br.ReadBytes(stringTableSize);
-        long dataOffset = 0x10 + fileCount * 0x18 + stringTableSize;
-
-        foreach (var e in entries)
-        {
-            string name = ReadCString(stringTable, e.NameOffset);
-            if (name.EndsWith(".nca", true, CultureInfo.InvariantCulture) && firstNca is null) firstNca = name;
 
             stream.Position = dataOffset + e.Offset;
             byte[] blob = br.ReadBytes((int)e.Size);
@@ -201,15 +164,32 @@ public sealed class UwpStorageProvider : IVirtualFileSystem
                 using var nsoStream = new MemoryStream(blob, writable: false);
                 return ReadNso(nsoStream);
             }
+
+            if (name.EndsWith(".nca", true, CultureInfo.InvariantCulture))
+            {
+                ncaCandidates.Add((name, blob));
+            }
         }
 
-        if (firstNca is not null)
+        // Caminho comercial mínimo: tentar extrair Program NSO de NCAs já descriptografados/dumpados em formato legível.
+        // Workaround isolado para UWP bring-up: não substitui pipeline NCA completo do upstream Eden.
+        foreach (var nca in PrioritizeNcaCandidates(ncaCandidates))
         {
-            BootDiagnostics.Error($"NSP contém NCA ({firstNca}) e requer pipeline NCA/NSO do Eden upstream. Caminho NRO-only não cobre título comercial.");
-            throw new InvalidDataException("NSP comercial detectado (NCA). Integração NCA/NSO pendente.");
+            if (TryExtractNsoFromNca(nca.Name, nca.Data, out RuntimeImage? image))
+            {
+                BootDiagnostics.Info($"Program NSO extraído de NCA: {nca.Name}");
+                return image!;
+            }
         }
 
-        throw new InvalidDataException("NSP sem conteúdo NRO suportado encontrado.");
+        if (ncaCandidates.Count > 0)
+        {
+            string firstNca = ncaCandidates[0].Name;
+            BootDiagnostics.Error($"NSP contém NCA ({firstNca}) mas nenhuma seção NSO legível foi encontrada. Necessário dump descriptografado/chaves corretas.");
+            throw new InvalidDataException("NSP comercial detectado (NCA não legível para extração de Program NSO).");
+        }
+
+        throw new InvalidDataException("NSP sem conteúdo executável suportado encontrado.");
     }
 
     private static RuntimeImage ReadNro(Stream stream)
@@ -267,6 +247,59 @@ public sealed class UwpStorageProvider : IVirtualFileSystem
         };
     }
 
+
+    private static IEnumerable<(string Name, byte[] Data)> PrioritizeNcaCandidates(List<(string Name, byte[] Data)> ncas)
+    {
+        return ncas
+            .OrderByDescending(x => x.Name.Contains("program", StringComparison.OrdinalIgnoreCase))
+            .ThenByDescending(x => x.Data.Length);
+    }
+
+    private static bool TryExtractNsoFromNca(string ncaName, byte[] ncaData, out RuntimeImage? image)
+    {
+        image = null;
+
+        // Estratégia pragmática: detectar NSO0 bruto dentro do blob NCA (caso dumps pré-processados).
+        int nsoOffset = IndexOfAscii(ncaData, "NSO0");
+        if (nsoOffset < 0)
+        {
+            BootDiagnostics.Warn($"NCA sem assinatura NSO0 visível: {ncaName}");
+            return false;
+        }
+
+        try
+        {
+            using var nsoStream = new MemoryStream(ncaData, nsoOffset, ncaData.Length - nsoOffset, writable: false);
+            image = ReadNso(nsoStream);
+            return true;
+        }
+        catch (Exception ex)
+        {
+            BootDiagnostics.Warn($"Falha ao parsear NSO embutido em {ncaName}: {ex.Message}");
+            return false;
+        }
+    }
+
+    private static int IndexOfAscii(byte[] data, string pattern)
+    {
+        byte[] pat = Encoding.ASCII.GetBytes(pattern);
+        for (int i = 0; i <= data.Length - pat.Length; i++)
+        {
+            bool match = true;
+            for (int j = 0; j < pat.Length; j++)
+            {
+                if (data[i + j] != pat[j])
+                {
+                    match = false;
+                    break;
+                }
+            }
+
+            if (match) return i;
+        }
+
+        return -1;
+    }
 
     private static RuntimeImage ReadNso(Stream stream)
     {
